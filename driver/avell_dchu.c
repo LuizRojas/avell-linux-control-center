@@ -41,9 +41,15 @@
 #include <linux/random.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/version.h>
 #include <acpi/battery.h>
 
 #include "avell_dchu_ioctl.h"
+
+/* platform_profile was reworked in 6.14 (class devices + ops table) */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
+#define AVELL_PPROF_CLASS	1
+#endif
 
 #define DCHU_BUF_LEN		256
 
@@ -116,7 +122,11 @@ struct avell_dchu {
 	unsigned int fx_tick;
 	u32 fx_last, fx_from, fx_to;
 
+#ifdef AVELL_PPROF_CLASS
+	struct device *pprof_dev;
+#else
 	struct platform_profile_handler pprof;
+#endif
 	bool pprof_registered;
 	enum platform_profile_option profile;
 
@@ -282,19 +292,9 @@ static int perf_from_profile(enum platform_profile_option p)
 	}
 }
 
-static int avell_profile_get(struct platform_profile_handler *pprof,
-			     enum platform_profile_option *profile)
+static int avell_profile_apply(struct avell_dchu *a,
+			       enum platform_profile_option profile)
 {
-	struct avell_dchu *a = container_of(pprof, struct avell_dchu, pprof);
-
-	*profile = a->profile;
-	return 0;
-}
-
-static int avell_profile_set(struct platform_profile_handler *pprof,
-			     enum platform_profile_option profile)
-{
-	struct avell_dchu *a = container_of(pprof, struct avell_dchu, pprof);
 	int perf = perf_from_profile(profile);
 	int ret;
 
@@ -308,6 +308,87 @@ static int avell_profile_set(struct platform_profile_handler *pprof,
 	return 0;
 }
 
+#ifdef AVELL_PPROF_CLASS
+
+static int avell_profile_probe(void *drvdata, unsigned long *choices)
+{
+	set_bit(PLATFORM_PROFILE_QUIET, choices);
+	set_bit(PLATFORM_PROFILE_LOW_POWER, choices);
+	set_bit(PLATFORM_PROFILE_BALANCED, choices);
+	set_bit(PLATFORM_PROFILE_PERFORMANCE, choices);
+	return 0;
+}
+
+static int avell_profile_get(struct device *dev,
+			     enum platform_profile_option *profile)
+{
+	struct avell_dchu *a = dev_get_drvdata(dev);
+
+	*profile = a->profile;
+	return 0;
+}
+
+static int avell_profile_set(struct device *dev,
+			     enum platform_profile_option profile)
+{
+	return avell_profile_apply(dev_get_drvdata(dev), profile);
+}
+
+static const struct platform_profile_ops avell_profile_ops = {
+	.probe = avell_profile_probe,
+	.profile_get = avell_profile_get,
+	.profile_set = avell_profile_set,
+};
+
+static int avell_profile_init(struct avell_dchu *a)
+{
+	/*
+	 * The firmware offers no getter; CC30 defaults to "Entertainment"
+	 * (balanced). Apply it so our state matches the hardware.
+	 */
+	a->profile = PLATFORM_PROFILE_BALANCED;
+	dchu_set_opt(a, OPT_PERF_PROFILE, PERF_ENTERTAINMENT);
+
+	a->pprof_dev = platform_profile_register(a->dev, "avell-dchu", a,
+						 &avell_profile_ops);
+	if (IS_ERR(a->pprof_dev)) {
+		int ret = PTR_ERR(a->pprof_dev);
+
+		dev_warn(a->dev, "platform_profile unavailable (%d)\n", ret);
+		return ret;
+	}
+	a->pprof_registered = true;
+	return 0;
+}
+
+static void avell_profile_notify(struct avell_dchu *a)
+{
+	platform_profile_notify(a->pprof_dev);
+}
+
+static void avell_profile_exit(struct avell_dchu *a)
+{
+	platform_profile_remove(a->pprof_dev);
+}
+
+#else /* !AVELL_PPROF_CLASS */
+
+static int avell_profile_get(struct platform_profile_handler *pprof,
+			     enum platform_profile_option *profile)
+{
+	struct avell_dchu *a = container_of(pprof, struct avell_dchu, pprof);
+
+	*profile = a->profile;
+	return 0;
+}
+
+static int avell_profile_set(struct platform_profile_handler *pprof,
+			     enum platform_profile_option profile)
+{
+	return avell_profile_apply(container_of(pprof, struct avell_dchu, pprof),
+				   profile);
+}
+
 static int avell_profile_init(struct avell_dchu *a)
 {
 	int ret;
@@ -319,10 +400,6 @@ static int avell_profile_init(struct avell_dchu *a)
 	set_bit(PLATFORM_PROFILE_BALANCED, a->pprof.choices);
 	set_bit(PLATFORM_PROFILE_PERFORMANCE, a->pprof.choices);
 
-	/*
-	 * The firmware offers no getter; CC30 defaults to "Entertainment"
-	 * (balanced). Apply it so our state matches the hardware.
-	 */
 	a->profile = PLATFORM_PROFILE_BALANCED;
 	dchu_set_opt(a, OPT_PERF_PROFILE, PERF_ENTERTAINMENT);
 
@@ -334,6 +411,18 @@ static int avell_profile_init(struct avell_dchu *a)
 	a->pprof_registered = true;
 	return 0;
 }
+
+static void avell_profile_notify(struct avell_dchu *a)
+{
+	platform_profile_notify();
+}
+
+static void avell_profile_exit(struct avell_dchu *a)
+{
+	platform_profile_remove();
+}
+
+#endif /* AVELL_PPROF_CLASS */
 
 /* ------------------------------------------------------------------ */
 /* hwmon                                                                */
@@ -1091,8 +1180,8 @@ static void avell_cycle_profile(struct avell_dchu *a)
 	for (i = 0; i < ARRAY_SIZE(order); i++)
 		if (order[i] == a->profile)
 			cur = i;
-	if (!avell_profile_set(&a->pprof, order[(cur + 1) % ARRAY_SIZE(order)]))
-		platform_profile_notify();
+	if (!avell_profile_apply(a, order[(cur + 1) % ARRAY_SIZE(order)]))
+		avell_profile_notify(a);
 }
 
 static void avell_handle_event(struct avell_dchu *a, u32 code)
@@ -1315,7 +1404,7 @@ static void avell_remove(struct platform_device *pdev)
 	if (a->misc.fops)
 		misc_deregister(&a->misc);
 	if (a->pprof_registered)
-		platform_profile_remove();
+		avell_profile_exit(a);
 	/* battery hook is devm managed; clear global after it is gone */
 	avell_global = NULL;
 }
